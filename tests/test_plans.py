@@ -113,7 +113,8 @@ def test_plans_reads_streets_when_present(drawn, tmp_path):
 
 
 def test_plans_take_their_frames_and_roman_storeys(drawn):
-    """A plan the panels' plan frames takes the frame's scale and is drawn to its size, its legend strip included."""
+    """A plan the panels' plan frames takes the frame's scale and is drawn to its size, its legend strip included;
+    placed on a panel (the base's marks "panel"), 8 mm less high, the room of the scale bar the panel draws under it."""
     out, site_dir = drawn
     frames = {"site-plan": ("plans/site-plan_1-3000.svg", "1:3000", 400, 300),
               "detail-area-1": ("plans/detail-area-1_1-500.svg", "1:500", 300, 180)}
@@ -126,9 +127,10 @@ def test_plans_take_their_frames_and_roman_storeys(drawn):
     style.write_text(json.dumps({**json.loads(keep), "storey_labels": "roman"}), encoding="utf-8")
     try:
         draw(out, site_dir)
+        bar = 8 if json.loads(keep)["marks"] == "panel" else 0
         for f, s, w, h in frames.values():
             svg = (out / f).read_text(encoding="utf-8")
-            assert abs(mm(svg, "width") - w) <= 0.5 and abs(mm(svg, "height") - h) <= 0.5, (f, mm(svg, "width"), mm(svg, "height"))
+            assert abs(mm(svg, "width") - w) <= 0.5 and abs(mm(svg, "height") - (h - bar)) <= 0.5, (f, mm(svg, "width"), mm(svg, "height"))
         storeys = re.findall(r'text-anchor="middle" fill="[^"]+">([^<]+)</text>', (out / frames["detail-area-1"][0]).read_text(encoding="utf-8"))
         assert storeys and all(re.fullmatch(r"[IVXL]+", s) for s in storeys), storeys
     finally:
@@ -151,11 +153,107 @@ def test_plans_draw_ground_floors_in_detail_areas_only(drawn):
         made = {e["name"]: e for e in json.loads((out / "plans/drawings.json").read_text(encoding="utf-8"))}
         detail = (out / "plans/detail-area-1_1-1000.svg").read_text(encoding="utf-8")
         assert "ground-floor" in made["detail-area-1"]["layers_used"] and ">Entrances</text>" in detail
+        assert "entrances (ground-floor)" not in made["detail-area-1"]["not_shown"]   # now it has them
         assert "ground-floor" not in made["site-plan"]["layers_used"]
         assert ">Entrances</text>" not in (out / "plans/site-plan_1-3000.svg").read_text(encoding="utf-8")
     finally:
         shutil.rmtree(gf)
         draw(out, site_dir)   # leave the module's drawings as the other tests expect them
+
+
+def made_of(out):
+    return {e["name"]: e for e in json.loads((out / "plans/drawings.json").read_text(encoding="utf-8"))}
+
+
+def test_plans_name_places_streets_and_detail_areas(drawn):
+    """Every plan names its squares; a detail area also its streets; each name once, on a halo."""
+    out, _ = drawn
+    detail = (out / "plans/detail-area-1_1-1000.svg").read_text(encoding="utf-8")
+    site = (out / "plans/site-plan_1-3000.svg").read_text(encoding="utf-8")
+    assert re.search(r'font-weight="bold"[^>]*>Square</text>', detail)
+    assert ">Main road</text>" in detail                                # the massing's street, by its name
+    assert ">Square</text>" in site
+    names = re.findall(r'paint-order="stroke">([^<]+)</text>', detail)
+    assert len(names) == len(set(names)), names
+    assert re.search(r'paint-order="stroke">Detail area 1</text>', site)   # the window's name, on a halo
+
+
+def test_plans_flag_overlapping_detail_areas(drawn):
+    out, site_dir = drawn
+    assert "overlaps" not in made_of(out)["detail-area-1"]
+    two = {**CONFIG, "detail_areas": CONFIG["detail_areas"] + [{"name": "detail-area-2", "scale": 1000, "at": "Corner"}]}
+    try:
+        r = draw(out, site_dir, two)
+        made = made_of(out)
+        assert made["detail-area-2"]["overlaps"][0]["with"] == "detail-area-1"
+        assert made["detail-area-1"]["overlaps"][0]["with"] == "detail-area-2"
+        assert "another `at`" in r.stderr
+    finally:
+        for f in (out / "plans").glob("detail-area-2_*"):
+            f.unlink()
+        draw(out, site_dir)   # leave the module's drawings as the other tests expect them
+
+
+def test_plans_hatch_public_ground_floors_in_detail_areas_only(drawn):
+    out, _ = drawn
+    mass = json.loads((out / "massing/massing.geojson").read_text(encoding="utf-8"))["features"]
+    assert any(str(f["properties"].get("ground_floor", "housing")) != "housing" for f in mass
+               if f["properties"].get("kind") == "building")             # the synthetic massing has some
+    detail = (out / "plans/detail-area-1_1-1000.svg").read_text(encoding="utf-8")
+    assert 'fill="url(#gf-detail-area-1)"' in detail and ">Ground floors open to the public</text>" in detail
+    assert 'fill="url(#gf-site-plan)"' not in (out / "plans/site-plan_1-3000.svg").read_text(encoding="utf-8")
+
+
+def test_plans_draw_the_idea_or_say_it_is_missing(drawn):
+    out, site_dir = drawn
+    accent = json.loads((out / "drawing-graphics/style.json").read_text(encoding="utf-8"))["accent"]
+    try:
+        draw(out, site_dir, {**CONFIG, "idea": {"label": "The green strip", "names": ["Strip"]}})
+        site = (out / "plans/site-plan_1-3000.svg").read_text(encoding="utf-8")
+        assert made_of(out)["site-plan"]["idea"].startswith("drawn")
+        assert ">The green strip</text>" in site and 'stroke="%s"' % accent in site
+        assert ">Strip</text>" not in site                                 # named once, as the idea
+        draw(out, site_dir, {**CONFIG, "idea": {"label": "Nothing", "names": ["Nowhere"]}})
+        assert made_of(out)["site-plan"]["idea"].startswith("missing")
+        assert ">Nothing</text>" not in (out / "plans/site-plan_1-3000.svg").read_text(encoding="utf-8")
+    finally:
+        draw(out, site_dir)   # leave the module's drawings as the other tests expect them
+
+
+def test_plans_draw_a_line_idea_as_a_band(drawn):
+    """An idea that is a line of the site (a valley's street) lies under the buildings as a pale band, named along it."""
+    out, site_dir = drawn
+    accent = json.loads((out / "drawing-graphics/style.json").read_text(encoding="utf-8"))["accent"]
+    try:
+        draw(out, site_dir, {**CONFIG, "idea": {"label": "The valley", "names": ["Pilsen-Allee"]}})
+        site = (out / "plans/site-plan_1-3000.svg").read_text(encoding="utf-8")
+        assert made_of(out)["site-plan"]["idea"].startswith("drawn")
+        assert site.index('fill="%s" fill-opacity=' % accent) < site.index('mix-blend-mode:multiply')   # under the buildings
+        assert re.search(r'font-weight="bold"[^>]*>The valley</text>', site)
+        assert ">Pilsen-Allee</text>" not in site                          # named once, as the idea
+    finally:
+        draw(out, site_dir)   # leave the module's drawings as the other tests expect them
+
+
+def test_plans_flag_a_weak_detail_area(drawn):
+    """A detail area off the site, with no new building in it, is flagged so the agent can move it."""
+    out, site_dir = drawn
+    assert "weak" not in made_of(out)["detail-area-1"]
+    g = shape(json.loads((site_dir / "site.geojson").read_text(encoding="utf-8"))["features"][0]["geometry"])
+    off = [round(g.bounds[0] - 0.02, 5), round(g.bounds[1] - 0.02, 5)]   # about 2 km off the site's corner
+    try:
+        r = draw(out, site_dir, {**CONFIG, "detail_areas": [{"name": "detail-area-1", "scale": 1000, "at": off}]})
+        weak = made_of(out)["detail-area-1"]
+        assert "weak" in weak and weak["new_buildings"] == 0 and weak["site_share"] < 0.6, weak
+        assert "is weak" in r.stderr
+    finally:
+        draw(out, site_dir)   # leave the module's drawings as the other tests expect them
+
+
+def test_plans_say_what_a_detail_area_cannot_show(drawn):
+    """Without ground-floor/, the detail area names the entrances as missing instead of inventing them."""
+    out, _ = drawn
+    assert "entrances (ground-floor)" in made_of(out)["detail-area-1"]["not_shown"]
 
 
 def test_plans_missing_required_stops(drawn):
@@ -165,3 +263,50 @@ def test_plans_missing_required_stops(drawn):
     assert r.returncode != 0
     assert "site_plan_scale" in r.stderr
     write_config(out, CONFIG)
+
+
+NORTH = re.compile(r'<circle[^>]*fill="none"[^>]*/><path d="M')      # the standard's north: a circle and one line
+TITLE = re.compile(r'font-weight="bold"[^>]*>[^<]*, 1:[\d,]+</text>')   # the strip's own title with its scale
+BAR = re.compile(r'>\d+ m</text>')                                     # the scale bar's last number, with its unit
+
+
+def marks(out):
+    return {f: (len(NORTH.findall(s)), len(TITLE.findall(s)), len(BAR.findall(s)))
+            for f in FILES for s in [(out / "plans" / (f + ".svg")).read_text(encoding="utf-8")]}
+
+
+def test_plans_on_a_panel_leave_caption_and_scale_bar_to_it(drawn):
+    """Issue #34: with the base's marks "panel", the panel writes each plan's caption and scale bar once; the plans
+    keep legend and source, and only the site plan keeps the north arrow (none of these plans is turned from north)."""
+    out, _ = drawn
+    assert json.loads((out / "drawing-graphics/style.json").read_text(encoding="utf-8"))["marks"] == "panel"
+    assert marks(out) == {"site-plan_1-3000": (1, 0, 0), "detail-area-1_1-1000": (0, 0, 0), "figure-ground_1-15000": (0, 0, 0)}
+    site = (out / "plans/site-plan_1-3000.svg").read_text(encoding="utf-8")
+    assert "Map data" in site or "OpenStreetMap" in site or "©" in site   # the source line stays
+
+
+def test_plans_shown_alone_keep_every_mark(drawn, tmp_path):
+    """A plan made to stand alone (marks "drawing") keeps its title with the scale, its north arrow and its scale bar."""
+    out, site_dir = drawn
+    alone = tmp_path / "alone"
+    shutil.copytree(out, alone)
+    style = alone / "drawing-graphics/style.json"
+    style.write_text(json.dumps({**json.loads(style.read_text(encoding="utf-8")), "marks": "drawing"}), encoding="utf-8")
+    draw(alone, site_dir)
+    assert all(m == (1, 1, 1) for m in marks(alone).values()), marks(alone)
+
+
+def test_plans_name_a_detail_area_with_no_free_corner(drawn, tmp_path):
+    """Buildings on every corner of the window: its name still goes on the site plan, as a name."""
+    out, site_dir = drawn
+    full = tmp_path / "full"
+    shutil.copytree(out, full)
+    path = full / "massing/massing.geojson"
+    gj = json.loads(path.read_text(encoding="utf-8"))
+    x0, y0, x1, y1 = shape(json.loads((site_dir / "site.geojson").read_text(encoding="utf-8"))["features"][0]["geometry"]).bounds
+    gj["features"].append({"type": "Feature", "geometry": mapping(box(x0 - 0.02, y0 - 0.02, x1 + 0.02, y1 + 0.02)),
+                           "properties": {"kind": "building", "use": "housing", "floors": 2, "height_m": 6}})
+    path.write_text(json.dumps(gj), encoding="utf-8")
+    draw(full, site_dir)
+    site = (full / "plans/site-plan_1-3000.svg").read_text(encoding="utf-8")
+    assert ">Detail area 1</text>" in site and ">start</text>" not in site
